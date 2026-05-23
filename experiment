@@ -1,0 +1,379 @@
+"""
+Multi-UAV AAM Optimizer
+M=2 UAVs | N=10 tasks | K=5 candidate stations | P=2 open stations
+"""
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import time
+
+# ── 1. Problem Instance ─────────────────────────────────────────
+class ProblemInstance:
+    def __init__(self, M=2, N=10, K=5, P=2, seed=42,
+                 M_max=3.0, E_max=500.0,
+                 alpha0=50.0, alpha1=20.0, beta0=30.0, beta1=10.0,
+                 T_srv=10.0, w1=1.0, w2=1.0, w3=1.0, area=100.0):
+        np.random.seed(seed)
+        self.M,self.N,self.K,self.P = M,N,K,P
+        self.M_max,self.E_max = M_max,E_max
+        self.alpha0,self.alpha1 = alpha0,alpha1
+        self.beta0,self.beta1   = beta0, beta1
+        self.T_srv = T_srv
+        self.w1,self.w2,self.w3 = w1,w2,w3
+        self.task_xy    = np.random.uniform(0,area,(N,2))
+        self.r          = np.random.uniform(0.3,1.2,N)
+        self.station_xy = np.random.uniform(0,area,(K,2))
+        self.c_fac      = np.random.uniform(10,30,K)
+        self.depot_xy   = np.array([area/2, area/2])
+        self.t_print    = self.r * 2.0
+        all_xy = np.vstack([self.task_xy, self.station_xy, self.depot_xy.reshape(1,2)])
+        n = N+K+1
+        self.D = np.linalg.norm(all_xy[:,None,:] - all_xy[None,:,:], axis=2)
+        self.depot_idx = N+K
+
+    def energy(self, a, b, m):
+        d   = self.D[a,b]
+        t_p = self.t_print[a] if a < self.N else 0.0
+        return (self.alpha0 + self.alpha1*m)*d + (self.beta0 + self.beta1*m)*t_p
+
+    def station_nodes(self, open_st):
+        return [self.N + s for s in open_st] or [self.depot_idx]
+
+
+# ── 2. Golden-section search (payload) ─────────────────────────
+def payload_cost(m, inst, open_st, tasks):
+    if m <= 0 or not tasks:
+        return 1e9
+    snodes = inst.station_nodes(open_st)
+    total_e = 0.0
+    for j in tasks:
+        ns = snodes[np.argmin([inst.D[j,s] for s in snodes])]
+        total_e += inst.energy(ns,j,m) + inst.energy(j,ns,m)
+    refill_penalty = (sum(inst.r[j] for j in tasks)/m) * inst.T_srv * 5.0
+    return total_e + refill_penalty
+
+def golden_section(f, a, b, tol=1e-3):
+    gr = (np.sqrt(5)+1)/2
+    c,d = b-(b-a)/gr, a+(b-a)/gr
+    for _ in range(50):
+        if abs(b-a) < tol: break
+        if f(c) < f(d): b=d
+        else: a=c
+        c,d = b-(b-a)/gr, a+(b-a)/gr
+    return (a+b)/2
+
+def optimize_payloads(inst, open_st, task_map):
+    payloads = []
+    for i in range(inst.M):
+        tasks = task_map.get(i,[])
+        if not tasks:
+            payloads.append(inst.M_max/2); continue
+        lo = max(max(inst.r[j] for j in tasks), 0.05)
+        m_opt = golden_section(lambda m: payload_cost(m,inst,open_st,tasks), lo, inst.M_max)
+        payloads.append(m_opt)
+    return payloads
+
+
+# ── 3. p-Median local exchange (facility location) ─────────────
+def pm_cost(open_set, inst):
+    if not open_set: return 1e9
+    snodes = [inst.N+s for s in open_set]
+    return sum(min(inst.D[j,s] for s in snodes) for j in range(inst.N))
+
+def facility_location(inst):
+    centroid = inst.task_xy.mean(axis=0)
+    dists = np.linalg.norm(inst.station_xy - centroid, axis=1)
+    open_set = set(np.argsort(dists)[:inst.P])
+    best = pm_cost(open_set, inst)
+    for _ in range(200):
+        improved = False
+        closed = set(range(inst.K)) - open_set
+        for s_out in list(open_set):
+            for s_in in closed:
+                cand = (open_set-{s_out})|{s_in}
+                c = pm_cost(cand, inst)
+                if c < best - 1e-6:
+                    best,open_set,improved = c,cand,True
+                    break
+            if improved: break
+        if not improved: break
+    return sorted(open_set)
+
+
+# ── 4. Task assignment ──────────────────────────────────────────
+def assign_tasks(inst, open_st):
+    snodes = inst.station_nodes(open_st)
+    dists = [min(inst.D[j,s] for s in snodes) for j in range(inst.N)]
+    order = np.argsort(dists)
+    asgn = {i:[] for i in range(inst.M)}
+    for idx,j in enumerate(order):
+        asgn[idx % inst.M].append(int(j))
+    return asgn
+
+
+# ── 5. Routing (energy-aware NN + repair) ──────────────────────
+def build_route(inst, m, tasks, open_st):
+    """
+    Returns list of (kind, node, finish_time) and total energy used.
+    kind: 'task' | 'station' | 'depot'
+    """
+    snodes = inst.station_nodes(open_st)
+    def nearest_s(node): return snodes[np.argmin([inst.D[node,s] for s in snodes])]
+    def can_reach(cur, nxt, E):
+        e_go   = inst.energy(cur, nxt, m)
+        e_back = inst.energy(nxt, nearest_s(nxt), m)
+        return E >= e_go + e_back + 1e-6
+
+    remaining = list(tasks)
+    cur, E, t = inst.depot_idx, inst.E_max, 0.0
+    route = []
+    safety = 0
+
+    while remaining and safety < 200:
+        safety += 1
+        feasible = [(j, inst.D[cur,j]) for j in remaining if can_reach(cur,j,E)]
+        if not feasible:
+            ns = nearest_s(cur)
+            t += inst.D[cur,ns]/10.0 + inst.T_srv
+            E  = inst.E_max
+            route.append(('station', ns, t))
+            cur = ns
+            continue
+        j,_ = min(feasible, key=lambda x:x[1])
+        E -= inst.energy(cur,j,m)
+        t += inst.D[cur,j]/10.0 + inst.t_print[j]
+        route.append(('task', j, t))
+        cur = j
+        remaining.remove(j)
+
+    t += inst.D[cur,inst.depot_idx]/10.0
+    route.append(('depot', inst.depot_idx, t))
+    return route
+
+
+def route_energy(inst, m, route):
+    nodes = [inst.depot_idx] + [r[1] for r in route]
+    return sum(inst.energy(nodes[k],nodes[k+1],m) for k in range(len(nodes)-1))
+
+
+# ── 6. Local search (swap + 2-opt, limited iterations) ─────────
+def local_search(inst, m, tasks, open_st, max_iter=30):
+    seq  = list(tasks)
+    best_route = build_route(inst,m,seq,open_st)
+    best_e     = route_energy(inst,m,best_route)
+    n = len(seq)
+
+    for _ in range(max_iter):
+        improved = False
+
+        # Swap
+        for i in range(n):
+            for j in range(i+1,n):
+                ns = seq[:]; ns[i],ns[j] = ns[j],ns[i]
+                r  = build_route(inst,m,ns,open_st)
+                e  = route_energy(inst,m,r)
+                if e < best_e - 1e-4:
+                    seq,best_route,best_e,improved = ns,r,e,True
+                    break
+            if improved: break
+
+        # 2-opt
+        if not improved:
+            for i in range(n-1):
+                for j in range(i+2,n+1):
+                    ns = seq[:i]+seq[i:j][::-1]+seq[j:]
+                    r  = build_route(inst,m,ns,open_st)
+                    e  = route_energy(inst,m,r)
+                    if e < best_e - 1e-4:
+                        seq,best_route,best_e,improved = ns,r,e,True
+                        break
+                if improved: break
+
+        if not improved: break
+
+    return best_route, best_e
+
+
+# ── 7. Objective ────────────────────────────────────────────────
+def objective(inst, routes, energies, open_st):
+    makespan = max(r[-1][2] for r in routes)
+    fac_cost = sum(inst.c_fac[s] for s in open_st)
+    total_e  = sum(energies)
+    F = inst.w1*total_e + inst.w2*makespan + inst.w3*fac_cost
+    return F, total_e, makespan, fac_cost
+
+
+# ── 8. Main decomposition loop ──────────────────────────────────
+def solve(inst, max_iter=15, eps=1e-3, verbose=True):
+    open_st  = facility_location(inst)
+    asgn     = assign_tasks(inst, open_st)
+    payloads = optimize_payloads(inst, open_st, asgn)
+    history  = []
+    F_prev   = 1e18
+    best = None
+
+    if verbose:
+        print(f"{'Iter':>4}  {'F':>10}  {'Energy':>9}  {'Makespan':>9}  {'FacCost':>8}  {'Time':>7}")
+        print("─"*56)
+
+    for it in range(max_iter):
+        t0 = time.time()
+        routes, energies = [], []
+        for i in range(inst.M):
+            r, e = local_search(inst, payloads[i], asgn[i], open_st)
+            routes.append(r); energies.append(e)
+
+        F,en,mk,fc = objective(inst, routes, energies, open_st)
+        elapsed = time.time()-t0
+        history.append({'iter':it,'F':F,'energy':en,'makespan':mk,'fac_cost':fc})
+
+        if verbose:
+            print(f"{it+1:>4}  {F:>10.3f}  {en:>9.3f}  {mk:>9.3f}  {fc:>8.3f}  {elapsed:>6.2f}s")
+
+        delta = abs(F-F_prev)/max(abs(F_prev),1e-9)
+        if delta < eps and it > 0:
+            if verbose: print(f"\nConverged at iter {it+1}  Δ={delta:.2e}")
+            best = (routes,energies,open_st,payloads,history)
+            break
+
+        # Upper level update
+        asgn     = assign_tasks(inst, open_st)
+        payloads = optimize_payloads(inst, open_st, asgn)
+        open_st  = facility_location(inst)
+        F_prev   = F
+        best     = (routes,energies,open_st,payloads,history)
+
+    return best
+
+
+# ── 9. Plots ────────────────────────────────────────────────────
+def plot_solution(inst, routes, energies, open_st, payloads):
+    fig, axes = plt.subplots(1,2,figsize=(14,6))
+    fig.suptitle("AAM Solution  (M=2, N=10, K=5, P=2)", fontsize=13, fontweight='bold')
+
+    ax = axes[0]
+    ax.set_title("Spatial layout & UAV routes", fontsize=11)
+    closed = [s for s in range(inst.K) if s not in open_st]
+    if closed:
+        ax.scatter(inst.station_xy[closed,0],inst.station_xy[closed,1],
+                   marker='s',c='#F1EFE8',edgecolors='#888780',s=90,label='Closed station',zorder=3)
+    ax.scatter(inst.station_xy[open_st,0],inst.station_xy[open_st,1],
+               marker='s',c='#FAEEDA',edgecolors='#BA7517',s=150,label='Open station',zorder=5,linewidths=1.2)
+    for s in open_st:
+        ax.text(inst.station_xy[s,0],inst.station_xy[s,1],f'S{s}',
+                ha='center',va='center',fontsize=7,color='#633806',fontweight='bold')
+
+    ax.scatter(inst.task_xy[:,0],inst.task_xy[:,1],
+               c='#E1F5EE',edgecolors='#0F6E56',s=110,label='Task',zorder=4)
+    for j in range(inst.N):
+        ax.text(inst.task_xy[j,0],inst.task_xy[j,1],f'{j}',
+                ha='center',va='center',fontsize=6.5,color='#085041',fontweight='bold')
+
+    ax.scatter(*inst.depot_xy,marker='*',c='#FCEBEB',edgecolors='#E24B4A',s=280,label='Depot',zorder=6)
+
+    colors = ['#534AB7','#1D9E75','#D85A30','#BA7517']
+    for i,route in enumerate(routes):
+        col = colors[i%len(colors)]
+        node_ids = [inst.depot_idx]+[r[1] for r in route]
+        xy = []
+        for n in node_ids:
+            if   n < inst.N:         xy.append(inst.task_xy[n])
+            elif n < inst.N+inst.K:  xy.append(inst.station_xy[n-inst.N])
+            else:                    xy.append(inst.depot_xy)
+        xy = np.array(xy)
+        ax.plot(xy[:,0],xy[:,1],'-o',color=col,lw=1.4,ms=3.5,alpha=0.8,
+                label=f'UAV {i}  m={payloads[i]:.2f}kg')
+
+    ax.legend(fontsize=7.5,loc='upper left')
+    ax.set_xlabel("x"); ax.set_ylabel("y")
+    ax.grid(True,alpha=0.18); ax.set_aspect('equal')
+
+    # Bar chart
+    ax2 = axes[1]
+    ax2.set_title("Per-UAV energy & makespan", fontsize=11)
+    x = np.arange(inst.M); w = 0.35
+    ax2.bar(x-w/2, energies, w, color='#AFA9EC', edgecolor='#534AB7',lw=0.5,label='Energy (Wh)')
+    ax3 = ax2.twinx()
+    finish_times = [r[-1][2] for r in routes]
+    ax3.bar(x+w/2, finish_times, w, color='#9FE1CB', edgecolor='#1D9E75',lw=0.5,label='Finish time (min)')
+    ax2.set_xticks(x); ax2.set_xticklabels([f'UAV {i}' for i in range(inst.M)])
+    ax2.set_ylabel("Energy (Wh)", color='#3C3489'); ax3.set_ylabel("Finish time (min)", color='#085041')
+    h1,l1 = ax2.get_legend_handles_labels(); h2,l2 = ax3.get_legend_handles_labels()
+    ax2.legend(h1+h2,l1+l2,fontsize=8); ax2.grid(True,alpha=0.18,axis='y')
+
+    plt.tight_layout()
+    return fig
+
+def plot_convergence(history):
+    fig, axes = plt.subplots(1,3,figsize=(13,4))
+    fig.suptitle("Convergence of decomposition algorithm", fontsize=12, fontweight='bold')
+    iters = [h['iter']+1 for h in history]
+    for ax,(key,label,col) in zip(axes,[
+        ('F','Total cost F','#534AB7'),
+        ('energy','Total energy (Wh)','#1D9E75'),
+        ('makespan','Makespan (min)','#D85A30')]):
+        vals = [h[key] for h in history]
+        ax.plot(iters,vals,'o-',color=col,lw=2,ms=5)
+        ax.set_xlabel("Iteration"); ax.set_ylabel(label); ax.set_title(label)
+        ax.set_xticks(iters); ax.grid(True,alpha=0.22)
+    plt.tight_layout()
+    return fig
+
+def plot_payload_curve(inst, open_st, asgn, uav_id=0):
+    tasks = asgn.get(uav_id,[])
+    if not tasks: return None
+    lo = max(max(inst.r[j] for j in tasks),0.05)
+    m_vals = np.linspace(lo, inst.M_max, 200)
+    costs  = [payload_cost(m,inst,open_st,tasks) for m in m_vals]
+    m_opt  = m_vals[np.argmin(costs)]
+    fig,ax = plt.subplots(figsize=(7,4))
+    ax.plot(m_vals,costs,color='#534AB7',lw=2,label='C(m)  total cost')
+    ax.axvline(m_opt,color='#E24B4A',ls='--',lw=1.8,label=f'm* = {m_opt:.3f} kg')
+    ax.scatter([m_opt],[min(costs)],color='#E24B4A',s=80,zorder=5)
+    ax.set_xlabel("Payload m (kg)"); ax.set_ylabel("Cost C(m)")
+    ax.set_title(f"Unimodal cost-payload curve  (UAV {uav_id})")
+    ax.legend(); ax.grid(True,alpha=0.22)
+    plt.tight_layout()
+    return fig
+
+
+# ── 10. Run ─────────────────────────────────────────────────────
+if __name__ == "__main__":
+    print("="*56)
+    print("  AAM Multi-UAV Optimizer  —  Minimum-scale experiment")
+    print("  M=2  N=10  K=5  P=2  seed=42")
+    print("="*56+"\n")
+
+    inst = ProblemInstance(M=2,N=10,K=5,P=2,seed=42)
+    print(f"Task demands (kg): {inst.r.round(3)}")
+    print(f"Station costs    : {inst.c_fac.round(2)}\n")
+
+    result = solve(inst, max_iter=15, eps=1e-3, verbose=True)
+    routes,energies,open_st,payloads,history = result
+
+    F,en,mk,fc = objective(inst,routes,energies,open_st)
+    print(f"\n{'='*56}")
+    print("  FINAL SOLUTION")
+    print(f"{'='*56}")
+    print(f"  Open stations   : {open_st}")
+    for i in range(inst.M):
+        task_seq = [r[1] for r in routes[i] if r[0]=='task']
+        sta_vis  = [r[1]-inst.N for r in routes[i] if r[0]=='station']
+        print(f"  UAV {i}: payload={payloads[i]:.3f}kg  tasks={task_seq}  "
+              f"station_visits={sta_vis}  finish={routes[i][-1][2]:.2f}min  energy={energies[i]:.2f}Wh")
+    print(f"\n  Total energy : {en:.3f} Wh")
+    print(f"  Makespan     : {mk:.3f} min")
+    print(f"  Facility cost: {fc:.3f}")
+    print(f"  Objective F  : {F:.3f}")
+
+    asgn_final = assign_tasks(inst,open_st)
+    fig1 = plot_solution(inst,routes,energies,open_st,payloads)
+    fig2 = plot_convergence(history)
+    fig3 = plot_payload_curve(inst,open_st,asgn_final,uav_id=0)
+
+    fig1.savefig("/mnt/user-data/outputs/aam_solution.png",    dpi=150,bbox_inches='tight')
+    fig2.savefig("/mnt/user-data/outputs/aam_convergence.png", dpi=150,bbox_inches='tight')
+    if fig3:
+        fig3.savefig("/mnt/user-data/outputs/aam_payload_curve.png",dpi=150,bbox_inches='tight')
+    print("\nAll plots saved.")
