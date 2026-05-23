@@ -135,6 +135,15 @@ def build_route(inst, m, tasks, open_st):
         feasible = [(j, inst.D[cur,j]) for j in remaining if can_reach(cur,j,E)]
         if not feasible:
             ns = nearest_s(cur)
+            # FIX: if no task is reachable and no station leg is feasible, terminate infeasible.
+            e_to_station = inst.energy(cur, ns, m)
+            if E < e_to_station - 1e-6:
+                return None
+            # FIX: prevent infinite station self-loop when already at nearest station.
+            if ns == cur:
+                return None
+            # FIX: enforce energy conservation on station travel before recharging.
+            E -= e_to_station
             t += inst.D[cur,ns]/10.0 + inst.T_srv
             E  = inst.E_max
             route.append(('station', ns, t))
@@ -147,12 +156,19 @@ def build_route(inst, m, tasks, open_st):
         cur = j
         remaining.remove(j)
 
+    # FIX: remaining tasks or safety break implies infeasible partial route.
+    if remaining:
+        return None
+
     t += inst.D[cur,inst.depot_idx]/10.0
     route.append(('depot', inst.depot_idx, t))
     return route
 
 
 def route_energy(inst, m, route):
+    # FIX: treat infeasible/empty routes safely.
+    if not route:
+        return np.inf
     nodes = [inst.depot_idx] + [r[1] for r in route]
     return sum(inst.energy(nodes[k],nodes[k+1],m) for k in range(len(nodes)-1))
 
@@ -161,6 +177,7 @@ def route_energy(inst, m, route):
 def local_search(inst, m, tasks, open_st, max_iter=30):
     seq  = list(tasks)
     best_route = build_route(inst,m,seq,open_st)
+    # FIX: keep infeasible incumbent as None/inf and skip infeasible neighbors.
     best_e     = route_energy(inst,m,best_route)
     n = len(seq)
 
@@ -172,6 +189,8 @@ def local_search(inst, m, tasks, open_st, max_iter=30):
             for j in range(i+1,n):
                 ns = seq[:]; ns[i],ns[j] = ns[j],ns[i]
                 r  = build_route(inst,m,ns,open_st)
+                if r is None:
+                    continue
                 e  = route_energy(inst,m,r)
                 if e < best_e - 1e-4:
                     seq,best_route,best_e,improved = ns,r,e,True
@@ -184,6 +203,8 @@ def local_search(inst, m, tasks, open_st, max_iter=30):
                 for j in range(i+2,n+1):
                     ns = seq[:i]+seq[i:j][::-1]+seq[j:]
                     r  = build_route(inst,m,ns,open_st)
+                    if r is None:
+                        continue
                     e  = route_energy(inst,m,r)
                     if e < best_e - 1e-4:
                         seq,best_route,best_e,improved = ns,r,e,True
@@ -197,6 +218,9 @@ def local_search(inst, m, tasks, open_st, max_iter=30):
 
 # ── 7. Objective ────────────────────────────────────────────────
 def objective(inst, routes, energies, open_st):
+    # FIX: robust handling of empty/infeasible routes.
+    if not routes or any((r is None) or (len(r)==0) for r in routes):
+        return np.inf, np.inf, np.inf, sum(inst.c_fac[s] for s in open_st)
     makespan = max(r[-1][2] for r in routes)
     fac_cost = sum(inst.c_fac[s] for s in open_st)
     total_e  = sum(energies)
